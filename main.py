@@ -1,14 +1,15 @@
+# main.py
 import os, json, io, re
 from typing import List, Optional, Literal
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi import Response
 from pydantic import BaseModel
+
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
 from PIL import Image
-import pytesseract
-import httpx
 
 # OCR guard (avoid crashing if Tesseract binary isn't installed)
 try:
@@ -16,17 +17,15 @@ try:
     HAS_OCR = True
 except Exception:
     HAS_OCR = False
-    
-# Load SOP book metadata from JSON
-SOP_BOOKS_DATA = {}
-try:
-    with open("sop_books.json","r",encoding="utf-8") as f:
-        SOP_BOOKS_DATA = json.load(f)
-except Exception as e:
-    print(f"[WARN] sop_books.json load failed: {e}")
-SOP_BOOKS = list(SOP_BOOKS_DATA.keys())
+
+import httpx
+
+from text_source import LocalJsonSource
+from generator import generate_questions_from_text
+
 
 app = FastAPI(title="AI Quiz Generator", version="1.0")
+
 
 # ---------- App data locations ----------
 DATA_DIR = os.getenv("DATA_DIR", "data")
@@ -34,19 +33,21 @@ BIBLE_DIR = os.getenv("BIBLE_DIR", os.path.join(DATA_DIR, "bible", "kjv"))
 EGW_DIR   = os.getenv("EGW_DIR",   os.path.join(DATA_DIR, "egw"))
 ENABLE_REMOTE_BIBLE = os.getenv("ENABLE_REMOTE_BIBLE", "false").lower() == "true"
 
+
 @app.on_event("startup")
 def startup():
     # Load local Bible + SOP JSONs once
     app.state.source = LocalJsonSource(BIBLE_DIR, EGW_DIR)
 
-from fastapi.responses import RedirectResponse, JSONResponse
-from fastapi import Response
 
+# ---------- Root & health ----------
 @app.get("/")
-def root(): return RedirectResponse(url="/docs")
+def root():
+    return RedirectResponse(url="/docs")
 
 @app.head("/")
-def root_head(): return Response(status_code=200)
+def root_head():
+    return Response(status_code=200)
 
 @app.get("/health")
 def health(verbose: bool = Query(False)):
@@ -65,6 +66,7 @@ def health(verbose: bool = Query(False)):
 @app.head("/health")
 def health_head():
     return Response(status_code=200)
+
 
 # ---------- Optional listings (handy for Swagger testing) ----------
 @app.get("/books", response_model=List[str])
@@ -89,7 +91,7 @@ def sop_chapters(title: str):
     return {"title": title, "chapters": len(app.state.source._egw_index[title])}
 
 
-# ---- LLM client (OpenAI-compatible) ----
+# ---------- LLM client (OpenAI-compatible) ----------
 from openai import OpenAI
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
@@ -127,6 +129,7 @@ class GenerateFromTextRequest(BaseModel):
     difficulty_mix: List[Literal["easy", "medium", "hard"]] = ["easy", "medium", "hard"]
     filename_or_ref: Optional[str] = None
 
+
 # ---------- Prompts ----------
 BIBLE_SYSTEM_PROMPT = """You generate fair, respectful quiz questions from Bible passages.
 - Avoid doctrinal slant; stick to the provided text.
@@ -137,59 +140,61 @@ BIBLE_SYSTEM_PROMPT = """You generate fair, respectful quiz questions from Bible
 DOC_SYSTEM_PROMPT = """You generate quiz questions from provided text (PDF/DOC/Images).
 - Use only the given text; no outside info.
 - Return ONLY JSON in this shape:
-{"items":[{"type":"mcq|true_false|short_answer","question":"...","choices":["..."],"answer":"...","difficulty":"easy|medium|hard","source":{"mode":"document","reference":"<filename or section>"},"explanation":"..."}]}
+{"items":[{"type":"mcq|true_false|short_answer","question":"...","choices":["...","...","...","..."],"answer":"...","difficulty":"easy|medium|hard","source":{"mode":"document","reference":"<filename or section>"},"explanation":"..."}]}
 """
 
 SOP_SYSTEM_PROMPT = """You generate quiz questions from Ellen White’s writings (Spirit of Prophecy).
 - Respect the text and keep questions faithful.
 - Return ONLY JSON in this shape:
-{"items":[{"type":"mcq|true_false|short_answer","question":"...","choices":["..."],"answer":"...","difficulty":"easy|medium|hard","source":{"mode":"sop","reference":"Book name ch.#"},"explanation":"..."}]}
+{"items":[{"type":"mcq|true_false|short_answer","question":"...","choices":["...","...","...","..."],"answer":"...","difficulty":"easy|medium|hard","source":{"mode":"sop","reference":"Book name ch.#"},"explanation":"..."}]}
 """
 
 MIXED_SYSTEM_PROMPT = """You generate quiz questions from BOTH Bible and Spirit of Prophecy texts.
 - Some questions may come from Bible, some from SOP, some comparing both.
 - Return ONLY JSON in this shape:
-{"items":[{"type":"mcq|true_false|short_answer","question":"...","choices":["..."],"answer":"...","difficulty":"easy|medium|hard","source":{"mode":"mixed","reference":"Bible+SOP"},"explanation":"..."}]}
+{"items":[{"type":"mcq|true_false|short_answer","question":"...","choices":["...","...","...","..."],"answer":"...","difficulty":"easy|medium|hard","source":{"mode":"mixed","reference":"Bible+SOP"},"explanation":"..."}]}
 """
 
+
 # ---------- Helpers ----------
-BOOKS = [ "Genesis","Exodus","Leviticus","Numbers","Deuteronomy","Joshua","Judges","Ruth",
-"1 Samuel","2 Samuel","1 Kings","2 Kings","1 Chronicles","2 Chronicles","Ezra","Nehemiah","Esther","Job",
-"Psalms","Proverbs","Ecclesiastes","Song of Solomon","Isaiah","Jeremiah","Lamentations","Ezekiel","Daniel",
-"Hosea","Joel","Amos","Obadiah","Jonah","Micah","Nahum","Habakkuk","Zephaniah","Haggai","Zechariah","Malachi",
-"Matthew","Mark","Luke","John","Acts","Romans","1 Corinthians","2 Corinthians","Galatians","Ephesians","Philippians",
-"Colossians","1 Thessalonians","2 Thessalonians","1 Timothy","2 Timothy","Titus","Philemon","Hebrews","James",
-"1 Peter","2 Peter","1 John","2 John","3 John","Jude","Revelation" ]
-
-SOP_BOOKS = [
-    "Steps to Christ","The Desire of Ages","The Great Controversy",
-    "Patriarchs and Prophets","Prophets and Kings","Education","Christ’s Object Lessons"
-]
-
 REF_REGEX = re.compile(
     r"^\s*(?:[1-3]\s*)?[A-Za-z\. ]+\s+\d+(?::\d+(?:-\d+)?)?(?:\s*[,;]\s*\d+(?::\d+(?:-\d+)?)?)*\s*$"
 )
 
 def looks_like_bible_reference(text: str) -> bool:
-    if not text: return False
-    if len(text) > 80: return False
-    return any(text.lower().startswith(b.lower()) for b in BOOKS) and bool(REF_REGEX.match(text))
+    if not text:
+        return False
+    if len(text) > 80:
+        return False
+    # light heuristic: starts with a loaded Bible book name
+    return any(text.lower().startswith(b.lower()) for b in app.state.source.bible_books()) and bool(REF_REGEX.match(text))
 
 async def fetch_bible_text(reference: str, translation: str = "KJV") -> Optional[str]:
     url = f"https://bible-api.com/{reference.replace(' ', '%20')}?translation={translation.lower()}"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client_http:
             r = await client_http.get(url)
-            if r.status_code != 200: return None
+            if r.status_code != 200:
+                return None
             data = r.json()
-            if "text" in data and data["text"].strip(): return data["text"]
-            if "verses" in data: return " ".join(v.get("text","") for v in data["verses"]).strip()
+            if "text" in data and data["text"].strip():
+                return data["text"]
+            if "verses" in data:
+                return " ".join(v.get("text", "") for v in data["verses"]).strip()
             return None
-    except: return None
+    except Exception:
+        return None
+
+from openai import OpenAI
 
 def call_llm_json(system_prompt: str, user_prompt: str) -> dict:
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    )
+    model = os.getenv("MODEL", "gpt-4o-mini")
     resp = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
@@ -200,40 +205,56 @@ def call_llm_json(system_prompt: str, user_prompt: str) -> dict:
     return json.loads(resp.choices[0].message.content)
 
 def clamp_text(text: str, max_chars: int = 15000) -> str:
-    return text.strip()[:max_chars]
+    return (text or "").strip()[:max_chars]
 
 def extract_text_from_file(file: UploadFile) -> str:
     name = (file.filename or "").lower()
     raw = file.file.read()
+
     if name.endswith(".pdf"):
         return pdf_extract_text(io.BytesIO(raw))
+
     if name.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(raw))
-        return "\n".join([p.text for p in doc.paragraphs])
-    if any(name.endswith(ext) for ext in [".png",".jpg",".jpeg",".tif",".tiff",".bmp",".webp"]) or file.content_type.startswith("image/"):
+        return "\n".join(p.text for p in doc.paragraphs)
+
+    if any(name.endswith(ext) for ext in [".png",".jpg",".jpeg",".tif",".tiff",".bmp",".webp"]) or (file.content_type or "").startswith("image/"):
+        if not HAS_OCR:
+            raise HTTPException(400, "OCR not enabled on this server (install tesseract-ocr).")
         image = Image.open(io.BytesIO(raw))
         return pytesseract.image_to_string(image)
+
+    # fallback: try plain text
     try:
         return raw.decode("utf-8", errors="ignore")
-    except: return ""
+    except Exception:
+        return ""
+
 
 def normalize_items(items: List[dict]) -> List[Question]:
     cleaned: List[Question] = []
     for it in items or []:
-        if "answer" not in it or "question" not in it or "source" not in it: continue
-        if it.get("type","mcq") == "mcq" and (not it.get("choices") or len(it["choices"]) != 4): continue
+        if "answer" not in it or "question" not in it or "source" not in it:
+            continue
+        if it.get("type", "mcq") == "mcq":
+            ch = (it.get("choices") or [])
+            if len(ch) < 2:
+                continue
+            # pad/truncate to 4 so the UI stays consistent
+            it["choices"] = (ch + ["N/A","N/A","N/A","N/A"])[:4]
         cleaned.append(Question(
-            type=it.get("type","mcq"),
-            question=it["question"].strip(),
+            type=it.get("type", "mcq"),
+            question=(it["question"] or "").strip(),
             choices=it.get("choices"),
-            answer=it["answer"].strip(),
-            difficulty=it.get("difficulty","medium"),
+            answer=(it["answer"] or "").strip(),
+            difficulty=it.get("difficulty", "medium"),
             source=Source(**it["source"]),
             explanation=it.get("explanation")
         ))
     return cleaned
 
-# ---------- Endpoints ----------
+
+# ---------- Generation endpoints ----------
 @app.post("/api/generate/bible", response_model=List[Question])
 async def generate_bible(req: GenerateBibleRequest):
     # (1) direct text provided
@@ -263,7 +284,7 @@ async def generate_bible(req: GenerateBibleRequest):
 Difficulty mix: {", ".join(req.difficulty_mix)}.
 Translation: {req.translation}.
 Passage:
-\"\"\"\n{text}\n\"\"\""""
+"""\n{text}\n""""""
     )
     return normalize_items(result.get("items", []))
 
@@ -296,7 +317,7 @@ def generate_sop(
 Difficulty mix: {difficulty_mix}.
 Source: {ref}
 Text:
-\"\"\"\n{passage}\n\"\"\""""
+"""\n{passage}\n""""""
     )
     return normalize_items(result.get("items", []))
 
@@ -310,7 +331,7 @@ def generate_from_text(req: GenerateFromTextRequest):
         f"""Generate {req.n} questions. Types: {", ".join(req.types)}.
 Difficulty mix: {", ".join(req.difficulty_mix)}.
 Source text:
-\"\"\"\n{text}\n\"\"\"\n
+"""\n{text}\n"""\n
 Reference: {ref}
 """
     )
@@ -350,7 +371,7 @@ def generate_mixed(
         f"""Generate {n} questions from BOTH Bible and SOP texts.
 Label them as 'mixed' in source.
 Text:
-\"\"\"\n{combined}\n\"\"\""""
+"""\n{combined}\n""""""
     )
     return normalize_items(result.get("items", []))
 
@@ -378,7 +399,7 @@ async def generate_auto(
             filename_or_ref=file.filename or "Uploaded file"
         ))
 
-# Raw text path
+    # Raw text path
     if text and text.strip():
         t = text.strip()
         if looks_like_bible_reference(t):
@@ -397,11 +418,12 @@ async def generate_auto(
                 ))
         # SOP quick guess: starts with a known SOP title
         if any(t.lower().startswith(b.lower()) for b in app.state.source.sop_books()):
-            # Require chapter from the text? If not present, let user supply chapter in SOP route.
-            return generate_sop(
-                book=t, chapter=None, text=None, n=n,
-                types=",".join(allowed_types), difficulty_mix=",".join(diff_mix)
-            )
+            # If chapter not in text, require user to call /api/generate/sop explicitly.
+            return generate_from_text(GenerateFromTextRequest(
+                text=clamp_text(t), n=n,
+                types=allowed_types, difficulty_mix=diff_mix,
+                filename_or_ref="User input (SOP-like)"
+            ))
         # Fallback: plain text
         return generate_from_text(GenerateFromTextRequest(
             text=clamp_text(t), n=n,
@@ -410,26 +432,3 @@ async def generate_auto(
         ))
 
     raise HTTPException(400, "Provide either text or a file.")
-        
-@app.get("/")
-def root():
-    # If you open your Render URL directly, go to Swagger docs
-    return RedirectResponse(url="/docs")
-
-@app.head("/")
-def root_head():
-    # Render does HEAD checks
-    return Response(status_code=200)
-
-@app.get("/health")
-def health():
-    # Optional: show how many SOP books were loaded
-    try:
-        count = len(SOP_BOOKS)
-    except:
-        count = 0
-    return JSONResponse({"ok": True, "books": count})
-
-@app.head("/health")
-def health_head():
-    return Response(status_code=200)
