@@ -1,6 +1,8 @@
 import os, json, io, re
 from typing import List, Optional, Literal
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi import Response
 from pydantic import BaseModel
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
@@ -8,7 +10,13 @@ from PIL import Image
 import pytesseract
 import httpx
 
-
+# OCR guard (avoid crashing if Tesseract binary isn't installed)
+try:
+    import pytesseract
+    HAS_OCR = True
+except Exception:
+    HAS_OCR = False
+    
 # Load SOP book metadata from JSON
 SOP_BOOKS_DATA = {}
 try:
@@ -20,6 +28,17 @@ SOP_BOOKS = list(SOP_BOOKS_DATA.keys())
 
 app = FastAPI(title="AI Quiz Generator", version="1.0")
 
+# ---------- App data locations ----------
+DATA_DIR = os.getenv("DATA_DIR", "data")
+BIBLE_DIR = os.getenv("BIBLE_DIR", os.path.join(DATA_DIR, "bible", "kjv"))
+EGW_DIR   = os.getenv("EGW_DIR",   os.path.join(DATA_DIR, "egw"))
+ENABLE_REMOTE_BIBLE = os.getenv("ENABLE_REMOTE_BIBLE", "false").lower() == "true"
+
+@app.on_event("startup")
+def startup():
+    # Load local Bible + SOP JSONs once
+    app.state.source = LocalJsonSource(BIBLE_DIR, EGW_DIR)
+
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi import Response
 
@@ -30,10 +49,44 @@ def root(): return RedirectResponse(url="/docs")
 def root_head(): return Response(status_code=200)
 
 @app.get("/health")
-def health():
-    try: count = len(SOP_BOOKS)
-    except: count = 0
-    return JSONResponse({"ok": True, "books": count})
+def health(verbose: bool = Query(False)):
+    bible_list = app.state.source.bible_books()
+    sop_list = app.state.source.sop_books()
+    resp = {
+        "ok": True,
+        "bible_books": len(bible_list),
+        "sop_books": len(sop_list),
+    }
+    if verbose:
+        resp["bible_loaded"] = bible_list
+        resp["sop_loaded"] = sop_list
+    return JSONResponse(resp)
+
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
+
+# ---------- Optional listings (handy for Swagger testing) ----------
+@app.get("/books", response_model=List[str])
+def list_bible_books():
+    return app.state.source.bible_books()
+
+@app.get("/chapters/{book}")
+def bible_chapter_count(book: str):
+    try:
+        return {"book": book, "chapters": app.state.source.bible_chapter_count(book)}
+    except KeyError:
+        raise HTTPException(404, f"Bible book not found: {book}")
+
+@app.get("/sop/books", response_model=List[str])
+def list_sop_books():
+    return app.state.source.sop_books()
+
+@app.get("/sop/chapters/{title}")
+def sop_chapters(title: str):
+    if title not in app.state.source._egw_index:
+        raise HTTPException(404, f"SOP book not found: {title}")
+    return {"title": title, "chapters": len(app.state.source._egw_index[title])}
 
 
 # ---- LLM client (OpenAI-compatible) ----
@@ -165,8 +218,8 @@ def extract_text_from_file(file: UploadFile) -> str:
     except: return ""
 
 def normalize_items(items: List[dict]) -> List[Question]:
-    cleaned = []
-    for it in items:
+    cleaned: List[Question] = []
+    for it in items or []:
         if "answer" not in it or "question" not in it or "source" not in it: continue
         if it.get("type","mcq") == "mcq" and (not it.get("choices") or len(it["choices"]) != 4): continue
         cleaned.append(Question(
@@ -182,41 +235,69 @@ def normalize_items(items: List[dict]) -> List[Question]:
 
 # ---------- Endpoints ----------
 @app.post("/api/generate/bible", response_model=List[Question])
-def generate_bible(req: GenerateBibleRequest):
-    passage = req.passage_text or f"(Reference: {req.reference})"
-    passage = clamp_text(passage)
-    user_prompt = f"""
-Generate {req.n} questions. Types: {", ".join(req.types)}.
+async def generate_bible(req: GenerateBibleRequest):
+    # (1) direct text provided
+    if req.passage_text and req.passage_text.strip():
+        text = clamp_text(req.passage_text)
+
+    # (2) try local JSONs by reference
+    elif req.reference:
+        try:
+            text = app.state.source.passage_text(req.reference)
+        except Exception:
+            text = None
+
+        # (3) optional fallback to remote API
+        if not text and ENABLE_REMOTE_BIBLE:
+            fetched = await fetch_bible_text(req.reference, translation=req.translation)
+            if not fetched:
+                raise HTTPException(400, f"Could not resolve reference: {req.reference}")
+            text = clamp_text(fetched)
+
+    else:
+        raise HTTPException(422, "Provide 'reference' or 'passage_text'.")
+
+    result = call_llm_json(
+        BIBLE_SYSTEM_PROMPT,
+        f"""Generate {req.n} questions. Types: {", ".join(req.types)}.
 Difficulty mix: {", ".join(req.difficulty_mix)}.
 Translation: {req.translation}.
 Passage:
-\"\"\"\n{passage}\n\"\"\""""
-    result = call_llm_json(BIBLE_SYSTEM_PROMPT, user_prompt)
+\"\"\"\n{text}\n\"\"\""""
+    )
     return normalize_items(result.get("items", []))
+
 
 @app.post("/api/generate/sop", response_model=List[Question])
 def generate_sop(
     book: str = Form(...),
-    chapter: Optional[str] = Form(None),
+    chapter: Optional[int] = Form(None),
     text: Optional[str] = Form(None),
     n: int = Form(5),
     types: str = Form("mcq,true_false"),
-    difficulty_mix: str = Form("easy,medium,hard")
+    difficulty_mix: str = Form("easy,medium,hard"),
 ):
-    if book not in SOP_BOOKS:
-        raise HTTPException(400, f"Unsupported SOP book: {book}")
+    # choose text source: direct text OR (book,chapter)
+    if text and text.strip():
+        passage = clamp_text(text)
+        ref = f"{book} (custom text)"
+    else:
+        if not chapter:
+            raise HTTPException(422, "Provide 'chapter' when no text is supplied.")
+        try:
+            passage = clamp_text(app.state.source.sop_chapter_text(book, int(chapter)))
+            ref = f"{book} ch.{chapter}"
+        except Exception as e:
+            raise HTTPException(400, str(e))
 
-    # Use provided text or build a placeholder reference
-    passage = text or f"(Book: {book}, Chapter: {chapter or 'unknown'})"
-
-    user_prompt = f"""
-Generate {n} questions. Types: {types}.
+    result = call_llm_json(
+        SOP_SYSTEM_PROMPT,
+        f"""Generate {n} questions. Types: {types}.
 Difficulty mix: {difficulty_mix}.
-Source: {book} {chapter or ''}
+Source: {ref}
 Text:
 \"\"\"\n{passage}\n\"\"\""""
-
-    result = call_llm_json(SOP_SYSTEM_PROMPT, user_prompt)
+    )
     return normalize_items(result.get("items", []))
 
 
@@ -224,33 +305,36 @@ Text:
 def generate_from_text(req: GenerateFromTextRequest):
     text = clamp_text(req.text)
     ref = req.filename_or_ref or "Provided text"
-    user_prompt = f"""
-Generate {req.n} questions. Types: {", ".join(req.types)}.
+    result = call_llm_json(
+        DOC_SYSTEM_PROMPT,
+        f"""Generate {req.n} questions. Types: {", ".join(req.types)}.
 Difficulty mix: {", ".join(req.difficulty_mix)}.
 Source text:
 \"\"\"\n{text}\n\"\"\"\n
 Reference: {ref}
 """
-    result = call_llm_json(DOC_SYSTEM_PROMPT, user_prompt)
+    )
     return normalize_items(result.get("items", []))
 
+
 @app.post("/api/generate/from-upload", response_model=List[Question])
-async def generate_from_upload(
+def generate_from_upload(
     file: UploadFile = File(...),
     n: int = Form(5),
     types: str = Form("mcq"),
-    difficulty_mix: str = Form("easy,medium,hard")
+    difficulty_mix: str = Form("easy,medium,hard"),
 ):
     text = extract_text_from_file(file)
     if not text.strip():
         raise HTTPException(400, "No text extracted from file")
     req = GenerateFromTextRequest(
         text=text, n=n,
-        types=[t.strip() for t in types.split(",")],
-        difficulty_mix=[d.strip() for d in difficulty_mix.split(",")],
-        filename_or_ref=file.filename
+        types=[t.strip() for t in types.split(",") if t.strip()],
+        difficulty_mix=[d.strip() for d in difficulty_mix.split(",") if d.strip()],
+        filename_or_ref=file.filename,
     )
     return generate_from_text(req)
+
 
 @app.post("/api/generate/mixed", response_model=List[Question])
 def generate_mixed(
@@ -258,16 +342,18 @@ def generate_mixed(
     sop_text: str = Form(...),
     n: int = Form(5),
     types: str = Form("mcq,true_false"),
-    difficulty_mix: str = Form("easy,medium,hard")
+    difficulty_mix: str = Form("easy,medium,hard"),
 ):
     combined = f"Bible:\n{bible_text}\n\nSOP:\n{sop_text}"
-    user_prompt = f"""
-Generate {n} questions from BOTH Bible and SOP texts.
+    result = call_llm_json(
+        MIXED_SYSTEM_PROMPT,
+        f"""Generate {n} questions from BOTH Bible and SOP texts.
 Label them as 'mixed' in source.
 Text:
 \"\"\"\n{combined}\n\"\"\""""
-    result = call_llm_json(MIXED_SYSTEM_PROMPT, user_prompt)
+    )
     return normalize_items(result.get("items", []))
+
 
 @app.post("/api/generate/auto", response_model=List[Question])
 async def generate_auto(
@@ -276,11 +362,12 @@ async def generate_auto(
     translation: Literal["KJV","WEB","Other"] = Form("KJV"),
     n: int = Form(5),
     types: str = Form("mcq,true_false"),
-    difficulty_mix: str = Form("easy,medium,hard")
+    difficulty_mix: str = Form("easy,medium,hard"),
 ):
     allowed_types = [t.strip() for t in types.split(",") if t.strip()]
     diff_mix = [d.strip() for d in difficulty_mix.split(",") if d.strip()]
 
+    # File upload path
     if file is not None:
         extracted = extract_text_from_file(file)
         if not extracted.strip():
@@ -291,16 +378,31 @@ async def generate_auto(
             filename_or_ref=file.filename or "Uploaded file"
         ))
 
+# Raw text path
     if text and text.strip():
         t = text.strip()
         if looks_like_bible_reference(t):
-            fetched = await fetch_bible_text(t, translation=translation)
-            if fetched: return generate_bible(GenerateBibleRequest(
-                translation=translation, reference=t, passage_text=fetched,
-                n=n, types=allowed_types, difficulty_mix=diff_mix
-            ))
-        if any(t.lower().startswith(b.lower()) for b in SOP_BOOKS):
-            return generate_sop(book=t, chapter=None, text=None, n=n, types=",".join(allowed_types), difficulty_mix=",".join(diff_mix))
+            local_text = None
+            try:
+                local_text = app.state.source.passage_text(t)
+            except Exception:
+                local_text = None
+            if not local_text and ENABLE_REMOTE_BIBLE:
+                fetched = await fetch_bible_text(t, translation=translation)
+                local_text = fetched
+            if local_text:
+                return await generate_bible(GenerateBibleRequest(
+                    translation=translation, reference=t, passage_text=local_text,
+                    n=n, types=allowed_types, difficulty_mix=diff_mix
+                ))
+        # SOP quick guess: starts with a known SOP title
+        if any(t.lower().startswith(b.lower()) for b in app.state.source.sop_books()):
+            # Require chapter from the text? If not present, let user supply chapter in SOP route.
+            return generate_sop(
+                book=t, chapter=None, text=None, n=n,
+                types=",".join(allowed_types), difficulty_mix=",".join(diff_mix)
+            )
+        # Fallback: plain text
         return generate_from_text(GenerateFromTextRequest(
             text=clamp_text(t), n=n,
             types=allowed_types, difficulty_mix=diff_mix,
@@ -308,10 +410,7 @@ async def generate_auto(
         ))
 
     raise HTTPException(400, "Provide either text or a file.")
-
-from fastapi.responses import RedirectResponse, JSONResponse
-from fastapi import Response
-
+        
 @app.get("/")
 def root():
     # If you open your Render URL directly, go to Swagger docs
