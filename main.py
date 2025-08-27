@@ -8,11 +8,33 @@ from PIL import Image
 import pytesseract
 import httpx
 
-# Load SOP book metadata from JSON
-with open("sop_books.json", "r", encoding="utf-8") as f:
-    SOP_BOOKS_DATA = json.load(f)
 
-SOP_BOOKS = list(SOP_BOOKS_DATA.keys())  # just the names for quick detection
+# Load SOP book metadata from JSON
+SOP_BOOKS_DATA = {}
+try:
+    with open("sop_books.json","r",encoding="utf-8") as f:
+        SOP_BOOKS_DATA = json.load(f)
+except Exception as e:
+    print(f"[WARN] sop_books.json load failed: {e}")
+SOP_BOOKS = list(SOP_BOOKS_DATA.keys())
+
+app = FastAPI(title="AI Quiz Generator", version="1.0")
+
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi import Response
+
+@app.get("/")
+def root(): return RedirectResponse(url="/docs")
+
+@app.head("/")
+def root_head(): return Response(status_code=200)
+
+@app.get("/health")
+def health():
+    try: count = len(SOP_BOOKS)
+    except: count = 0
+    return JSONResponse({"ok": True, "books": count})
+
 
 # ---- LLM client (OpenAI-compatible) ----
 from openai import OpenAI
@@ -22,7 +44,6 @@ client = OpenAI(
 )
 MODEL = os.getenv("MODEL", "gpt-4o-mini")
 
-app = FastAPI(title="AI Quiz Generator", version="1.0")
 
 # ---------- Schemas ----------
 class Source(BaseModel):
