@@ -287,3 +287,29 @@ async def generate_auto(
         ))
 
     raise HTTPException(400, "Provide either text or a file.")
+
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi import Response
+
+@app.get("/")
+def root():
+    # If you open your Render URL directly, go to Swagger docs
+    return RedirectResponse(url="/docs")
+
+@app.head("/")
+def root_head():
+    # Render does HEAD checks
+    return Response(status_code=200)
+
+@app.get("/health")
+def health():
+    # Optional: show how many SOP books were loaded
+    try:
+        count = len(SOP_BOOKS)
+    except:
+        count = 0
+    return JSONResponse({"ok": True, "books": count})
+
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
