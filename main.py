@@ -8,6 +8,12 @@ from PIL import Image
 import pytesseract
 import httpx
 
+# Load SOP book metadata from JSON
+with open("sop_books.json", "r", encoding="utf-8") as f:
+    SOP_BOOKS_DATA = json.load(f)
+
+SOP_BOOKS = list(SOP_BOOKS_DATA.keys())  # just the names for quick detection
+
 # ---- LLM client (OpenAI-compatible) ----
 from openai import OpenAI
 client = OpenAI(
@@ -178,15 +184,20 @@ def generate_sop(
 ):
     if book not in SOP_BOOKS:
         raise HTTPException(400, f"Unsupported SOP book: {book}")
+
+    # Use provided text or build a placeholder reference
     passage = text or f"(Book: {book}, Chapter: {chapter or 'unknown'})"
+
     user_prompt = f"""
 Generate {n} questions. Types: {types}.
 Difficulty mix: {difficulty_mix}.
 Source: {book} {chapter or ''}
 Text:
 \"\"\"\n{passage}\n\"\"\""""
+
     result = call_llm_json(SOP_SYSTEM_PROMPT, user_prompt)
     return normalize_items(result.get("items", []))
+
 
 @app.post("/api/generate/from-text", response_model=List[Question])
 def generate_from_text(req: GenerateFromTextRequest):
