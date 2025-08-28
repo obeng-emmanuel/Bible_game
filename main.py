@@ -161,6 +161,12 @@ REF_REGEX = re.compile(
     r"^\s*(?:[1-3]\s*)?[A-Za-z\. ]+\s+\d+(?::\d+(?:-\d+)?)?(?:\s*[,;]\s*\d+(?::\d+(?:-\d+)?)?)*\s*$"
 )
 
+# put this above your endpoints (e.g., after normalize_items)
+def wrap_text_block(label: str, body: str) -> str:
+    # Avoid nested triple quotes entirely
+    return f"{label}\n<<<TEXT>>>\n{body}\n<<<END>>>"
+
+
 def looks_like_bible_reference(text: str) -> bool:
     if not text:
         return False
@@ -341,15 +347,18 @@ async def generate_bible(req: GenerateBibleRequest):
     else:
         raise HTTPException(422, "Provide 'reference' or 'passage_text'.")
 
-    result = call_llm_json(
-        BIBLE_SYSTEM_PROMPT,
-        f"""Generate {req.n} questions. Types: {", ".join(req.types)}.
-Difficulty mix: {", ".join(req.difficulty_mix)}.
-Translation: {req.translation}.
-Passage:
-\"\"\"\n{text}\n\"\"\""""
+        user_prompt = wrap_text_block(
+        label=(
+            f"Generate {req.n} questions. "
+            f"Types: {', '.join(req.types)}.\n"
+            f"Difficulty mix: {', '.join(req.difficulty_mix)}.\n"
+            f"Translation: {req.translation}."
+        ),
+        body=text,
     )
+    result = call_llm_json(BIBLE_SYSTEM_PROMPT, user_prompt)
     return normalize_items(result.get("items", []))
+
 
 
 @app.post("/api/generate/sop", response_model=List[Question])
@@ -374,32 +383,37 @@ def generate_sop(
         except Exception as e:
             raise HTTPException(400, str(e))
 
-    result = call_llm_json(
-        SOP_SYSTEM_PROMPT,
-        f"""Generate {n} questions. Types: {types}.
-Difficulty mix: {difficulty_mix}.
-Source: {ref}
-Text:
-\"\"\"\n{passage}\n\"\"\""""
+       user_prompt = wrap_text_block(
+        label=(
+            f"Generate {n} questions. Types: {types}.\n"
+            f"Difficulty mix: {difficulty_mix}.\n"
+            f"Source: {ref}"
+        ),
+        body=passage,
     )
+    result = call_llm_json(SOP_SYSTEM_PROMPT, user_prompt)
     return normalize_items(result.get("items", []))
+
 
 
 @app.post("/api/generate/from-text", response_model=List[Question])
 def generate_from_text(req: GenerateFromTextRequest):
     text = clamp_text(req.text)
     ref = req.filename_or_ref or "Provided text"
-    # ✅ fixed (keep your current style)
-result = call_llm_json(
-    DOC_SYSTEM_PROMPT,
-    f"""Generate {req.n} questions. Types: {", ".join(req.types)}.
-Difficulty mix: {", ".join(req.difficulty_mix)}.
-Source text:
-\"\"\"\n{text}\n\"\"\"\n
-Reference: {ref}
-"""
-)
+
+    user_prompt = wrap_text_block(
+        label=(
+            f"Generate {req.n} questions. "
+            f"Types: {', '.join(req.types)}.\n"
+            f"Difficulty mix: {', '.join(req.difficulty_mix)}.\n"
+            f"Reference: {ref}"
+        ),
+        body=text,
+    )
+
+    result = call_llm_json(DOC_SYSTEM_PROMPT, user_prompt)
     return normalize_items(result.get("items", []))
+
 
 
 @app.post("/api/generate/from-upload", response_model=List[Question])
@@ -429,15 +443,17 @@ def generate_mixed(
     types: str = Form("mcq,true_false"),
     difficulty_mix: str = Form("easy,medium,hard"),
 ):
-    combined = f"Bible:\n{bible_text}\n\nSOP:\n{sop_text}"
-    result = call_llm_json(
-        MIXED_SYSTEM_PROMPT,
-        f"""Generate {n} questions from BOTH Bible and SOP texts.
-Label them as 'mixed' in source.
-Text:
-\"\"\"\n{combined}\n\"\"\""""
+        combined = f"Bible:\n{bible_text}\n\nSOP:\n{sop_text}"
+    user_prompt = wrap_text_block(
+        label=(
+            f"Generate {n} questions from BOTH Bible and SOP texts.\n"
+            f"Label them as 'mixed' in source."
+        ),
+        body=combined,
     )
+    result = call_llm_json(MIXED_SYSTEM_PROMPT, user_prompt)
     return normalize_items(result.get("items", []))
+
 
 @app.post("/api/egw/upload-pdf")
 async def egw_upload_pdf(file: UploadFile = File(...), title: Optional[str] = Form(None)):
@@ -492,15 +508,17 @@ async def generate_sop_from_pdf(
     passage = clamp_text(chosen["text"])
     ref = f"{file.filename or 'PDF'} — {chosen['title']} (ch {chapter})"
 
-    result = call_llm_json(
-        SOP_SYSTEM_PROMPT,
-        f"""Generate {n} questions. Types: {types}.
-Difficulty mix: {difficulty_mix}.
-Source: {ref}
-Text:
-\"\"\"\n{passage}\n\"\"\""""
+        user_prompt = wrap_text_block(
+        label=(
+            f"Generate {n} questions. Types: {types}.\n"
+            f"Difficulty mix: {difficulty_mix}.\n"
+            f"Source: {ref}"
+        ),
+        body=passage,
     )
+    result = call_llm_json(SOP_SYSTEM_PROMPT, user_prompt)
     return normalize_items(result.get("items", []))
+
 
 
 @app.post("/api/generate/auto", response_model=List[Question])
