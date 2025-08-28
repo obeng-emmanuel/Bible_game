@@ -8,3 +8,4 @@ Pillow
 pytesseract
 openai
 httpx
+pdf2image
