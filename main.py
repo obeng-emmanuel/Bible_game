@@ -322,6 +322,8 @@ def load_cached_pdf_chapter(title: str, chapter: int) -> dict:
         raise HTTPException(404, f"No cached chapter {chapter} for '{title}'. Upload and cache the PDF first.")
     return json.loads(fp.read_text(encoding="utf-8"))
 
+def wrap_text_block(label: str, body: str) -> str:
+    return f"{label}\n<<<TEXT>>>\n{body}\n<<<END>>>"
 
 # ---------- Generation endpoints ----------
 @app.post("/api/generate/bible", response_model=List[Question])
