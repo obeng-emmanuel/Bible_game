@@ -347,7 +347,7 @@ async def generate_bible(req: GenerateBibleRequest):
 Difficulty mix: {", ".join(req.difficulty_mix)}.
 Translation: {req.translation}.
 Passage:
-"""\n{text}\n""""""
+\"\"\"\n{text}\n\"\"\""""
     )
     return normalize_items(result.get("items", []))
 
