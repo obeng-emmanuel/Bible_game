@@ -254,6 +254,69 @@ def normalize_items(items: List[dict]) -> List[Question]:
     return cleaned
 
 
+# --- PDF → chapters helpers ---
+
+# Tweak these if your PDFs use different headings
+CHAPTER_PATTERNS = [
+    r"(?m)^\s*Chapter\s+\d+[^A-Za-z0-9]?",   # "Chapter 1", "Chapter 3:"
+    r"(?m)^\s*CHAPTER\s+\d+[^A-Za-z0-9]?",   # uppercase variant
+]
+
+def split_pdf_into_chapters(file_bytes: bytes) -> List[dict]:
+    """
+    Return: [{"title": "...", "text": "..."}] for each detected chapter.
+    If chapter headings aren't found, returns single 'Full Document'.
+    """
+    full = pdf_extract_text(io.BytesIO(file_bytes)) or ""
+    full = full.strip()
+    if len(full) < 80:
+        # PDF has almost no extractable text (likely scanned images)
+        raise HTTPException(400, "No extractable text found in PDF (may be scanned). Enable OCR or use text-based PDFs.")
+
+    pattern = re.compile("|".join(CHAPTER_PATTERNS))
+    matches = list(pattern.finditer(full))
+    if not matches:
+        # no headings — treat entire PDF as one "chapter"
+        return [{"title": "Full Document", "text": full}]
+
+    # Collect chapter slices by the index positions
+    starts = [m.start() for m in matches] + [len(full)]
+    chapters = []
+    for i in range(len(starts) - 1):
+        chunk = full[starts[i]:starts[i+1]].strip()
+        lines = [ln for ln in chunk.splitlines() if ln.strip()]
+        title = lines[0].strip() if lines else f"Chapter {i+1}"
+        body = "\n".join(lines[1:]).strip() if len(lines) > 1 else chunk
+        chapters.append({"title": title, "text": body})
+    return chapters
+
+def cache_pdf_chapters(title: str, chapters: List[dict]) -> dict:
+    """
+    Save split chapters to disk so they can be reused without re-uploading.
+    Files go under: data/egw_pdf/<title>/chapter_XX.json
+    """
+    base = Path(os.getenv("DATA_DIR", "data")) / "egw_pdf" / title
+    base.mkdir(parents=True, exist_ok=True)
+    meta = {"title": title, "chapters": len(chapters)}
+    (base / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    for i, ch in enumerate(chapters, 1):
+        (base / f"chapter_{i:02d}.json").write_text(json.dumps(ch, ensure_ascii=False, indent=2), encoding="utf-8")
+    return meta
+
+def load_cached_pdf_titles() -> List[str]:
+    base = Path(os.getenv("DATA_DIR", "data")) / "egw_pdf"
+    if not base.exists():
+        return []
+    return sorted([p.name for p in base.iterdir() if p.is_dir() and (p / "meta.json").exists()])
+
+def load_cached_pdf_chapter(title: str, chapter: int) -> dict:
+    base = Path(os.getenv("DATA_DIR", "data")) / "egw_pdf" / title
+    fp = base / f"chapter_{chapter:02d}.json"
+    if not fp.exists():
+        raise HTTPException(404, f"No cached chapter {chapter} for '{title}'. Upload and cache the PDF first.")
+    return json.loads(fp.read_text(encoding="utf-8"))
+
+
 # ---------- Generation endpoints ----------
 @app.post("/api/generate/bible", response_model=List[Question])
 async def generate_bible(req: GenerateBibleRequest):
@@ -372,6 +435,69 @@ def generate_mixed(
 Label them as 'mixed' in source.
 Text:
 """\n{combined}\n""""""
+    )
+    return normalize_items(result.get("items", []))
+
+@app.post("/api/egw/upload-pdf")
+async def egw_upload_pdf(file: UploadFile = File(...), title: Optional[str] = Form(None)):
+    raw = await file.read()
+    chs = split_pdf_into_chapters(raw)
+    # Guess a cache title if none provided (strip extension)
+    title_guess = title or (file.filename or "EGW_PDF").rsplit(".", 1)[0]
+    meta = cache_pdf_chapters(title_guess, chs)
+    # Return first few chapter titles so you can pick quickly
+    sample = [c["title"] for c in chs[:min(5, len(chs))]]
+    return {"ok": True, "title": title_guess, "chapters": meta["chapters"], "sample_titles": sample}
+
+@app.get("/api/egw/cached")
+def list_cached_egw_pdfs():
+    return {"titles": load_cached_pdf_titles()}
+
+
+@app.post("/api/generate/sop-from-cache", response_model=List[Question])
+def generate_sop_from_cache(
+    title: str = Form(...),
+    chapter: int = Form(...),
+    n: int = Form(5),
+    types: str = Form("mcq,true_false"),
+    difficulty_mix: str = Form("easy,medium,hard"),
+):
+    ch = load_cached_pdf_chapter(title, int(chapter))
+    passage = clamp_text(ch["text"])
+    ref = f"{title} — {ch['title']} (ch {chapter})"
+    result = call_llm_json(
+        SOP_SYSTEM_PROMPT,
+        f"""Generate {n} questions. Types: {types}.
+Difficulty mix: {difficulty_mix}.
+Source: {ref}
+Text:
+\"\"\"\n{passage}\n\"\"\""""
+    )
+    return normalize_items(result.get("items", []))
+
+@app.post("/api/generate/sop-from-pdf", response_model=List[Question])
+async def generate_sop_from_pdf(
+    file: UploadFile = File(...),
+    chapter: int = Form(..., description="1-based chapter index after splitting"),
+    n: int = Form(5),
+    types: str = Form("mcq,true_false"),
+    difficulty_mix: str = Form("easy,medium,hard"),
+):
+    raw = await file.read()
+    chs = split_pdf_into_chapters(raw)
+    if chapter < 1 or chapter > len(chs):
+        raise HTTPException(422, f"Chapter must be between 1 and {len(chs)} (detected).")
+    chosen = chs[chapter - 1]
+    passage = clamp_text(chosen["text"])
+    ref = f"{file.filename or 'PDF'} — {chosen['title']} (ch {chapter})"
+
+    result = call_llm_json(
+        SOP_SYSTEM_PROMPT,
+        f"""Generate {n} questions. Types: {types}.
+Difficulty mix: {difficulty_mix}.
+Source: {ref}
+Text:
+\"\"\"\n{passage}\n\"\"\""""
     )
     return normalize_items(result.get("items", []))
 
