@@ -380,7 +380,7 @@ def generate_sop(
 Difficulty mix: {difficulty_mix}.
 Source: {ref}
 Text:
-"""\n{passage}\n""""""
+\"\"\"\n{passage}\n\"\"\""""
     )
     return normalize_items(result.get("items", []))
 
@@ -394,7 +394,7 @@ def generate_from_text(req: GenerateFromTextRequest):
         f"""Generate {req.n} questions. Types: {", ".join(req.types)}.
 Difficulty mix: {", ".join(req.difficulty_mix)}.
 Source text:
-"""\n{text}\n"""\n
+\"\"\"\n{text}\n\"\""\n
 Reference: {ref}
 """
     )
@@ -434,7 +434,7 @@ def generate_mixed(
         f"""Generate {n} questions from BOTH Bible and SOP texts.
 Label them as 'mixed' in source.
 Text:
-"""\n{combined}\n""""""
+\"\"\"\n{combined}\n\"\"\""""
     )
     return normalize_items(result.get("items", []))
 
