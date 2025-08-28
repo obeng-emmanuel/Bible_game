@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
 from PIL import Image
+from pathlib import Path
 
 # OCR guard (avoid crashing if Tesseract binary isn't installed)
 try:
@@ -117,7 +118,6 @@ class Question(BaseModel):
 class GenerateBibleRequest(BaseModel):
     translation: Literal["KJV", "WEB", "Other"] = "KJV"
     reference: Optional[str] = None
-    passage_text: Optional[str] = None
     n: int = 5
     types: List[Literal["mcq", "true_false", "short_answer"]] = ["mcq"]
     difficulty_mix: List[Literal["easy", "medium", "hard"]] = ["easy", "medium", "hard"]
@@ -389,15 +389,16 @@ Text:
 def generate_from_text(req: GenerateFromTextRequest):
     text = clamp_text(req.text)
     ref = req.filename_or_ref or "Provided text"
-    result = call_llm_json(
-        DOC_SYSTEM_PROMPT,
-        f"""Generate {req.n} questions. Types: {", ".join(req.types)}.
+    # ✅ fixed (keep your current style)
+result = call_llm_json(
+    DOC_SYSTEM_PROMPT,
+    f"""Generate {req.n} questions. Types: {", ".join(req.types)}.
 Difficulty mix: {", ".join(req.difficulty_mix)}.
 Source text:
-\"\"\"\n{text}\n\"\""\n
+\"\"\"\n{text}\n\"\"\"\n
 Reference: {ref}
 """
-    )
+)
     return normalize_items(result.get("items", []))
 
 
